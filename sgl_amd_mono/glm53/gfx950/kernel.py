@@ -5708,7 +5708,7 @@ def build_glm5_monokernel(
                         lds_st(xs, tid, bf16_pair(o0, o1))
                     gpu.barrier()
                     acc = run_units(u_uv, UV_UNITS, UV_UNITS, pre)
-                    reduce_rows(UV_R, acc, emit_out(UV_TILE))
+                    reduce_rows(UV_R, acc, emit_out(UV_TILE), 1)
                     stamp("uv", tt, 3)
                     gpu.barrier()
                     if tid < UV_TILE // 4:
