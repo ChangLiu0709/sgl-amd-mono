@@ -346,8 +346,8 @@ class _Draft:
         backend = get_attn_backend().decode_attention_backend_str
         if backend not in DRAFT_ATTENTION_BACKENDS:
             raise ValueError(
-                f"--enable-amd-monokernel: {SPEC.name} needs a draft attention "
-                f"backend in {sorted(DRAFT_ATTENTION_BACKENDS)}, this {mode} step's is "
+                f"monokernel {SPEC.name} needs a draft attention backend "
+                f"in {sorted(DRAFT_ATTENTION_BACKENDS)}, this {mode} step's is "
                 f"{backend!r}"
             )
         self.backend_checked.add(mode)
