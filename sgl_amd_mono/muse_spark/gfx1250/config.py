@@ -37,10 +37,16 @@ LAYERS = 62
 LAYER_SLOTS = 128  # mailbox tags: step * LAYER_SLOTS + layer + 1
 MAX_TOKENS = 64  # C8 x 8 draft tokens
 # The widths the monokernels serve: rows = rows a request (1 for plain decode, the draft tokens for a
-# speculative verify) x running requests. Default: 8 and 16 rows. SGLANG_AMD_MONO_MUSE_WIDTHS picks them
-# ("1,2,4,8": plain decode steps of one to eight requests, a row a request). The draft's kernels take 16 rows
+# speculative verify) x running requests. Default: every plain decode step of one to sixteen requests, a row a
+# request and a kernel set a batch size. SGLang captures a decode graph a width and drops its own sizes below the
+# widest, so a batch size without a width runs the next width's kernels with padded rows, and a padded row costs
+# about what a real one does (the replay leaves its token id as it was: it routes to experts of its own).
+# SGLANG_AMD_MONO_MUSE_WIDTHS picks them (fewer widths: a shorter first start). The draft's kernels take 16 rows
 # at most (``draft.DRAFT_WIDTHS``).
 WIDTHS = tuple(
-    int(x) for x in os.environ.get("SGLANG_AMD_MONO_MUSE_WIDTHS", "8,16").split(",")
+    int(x)
+    for x in os.environ.get(
+        "SGLANG_AMD_MONO_MUSE_WIDTHS", "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16"
+    ).split(",")
 )
-assert all(w in (1, 2, 4, 8, 16, 32, 64) for w in WIDTHS) and WIDTHS, WIDTHS
+assert all(w in (*range(1, 17), 32, 64) for w in WIDTHS) and WIDTHS, WIDTHS

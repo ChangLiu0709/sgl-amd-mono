@@ -54,6 +54,10 @@ from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.muse_spark import DRAFT_TOKENS, HF_CONFIG, TP
 
 if GFX1250:
+    # The server's expert-item form (``gfx1250.stages.ffn.K3_WAVE``): a wave streams a whole item through its own
+    # LDS ring. It reads the expert input K2 stages, as every layer the runner builds does; a standalone K3 build
+    # (the kernel tests) keeps the module's own default. Set here, before the kernels' modules are imported.
+    os.environ.setdefault("SGLANG_AMD_MONO_K3_WAVE", "2")
     from sgl_amd_mono.muse_spark.gfx1250.config import WIDTHS
 else:
     from sgl_amd_mono.muse_spark.gfx950.config import WIDTHS

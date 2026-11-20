@@ -215,19 +215,19 @@ def gfx1250_experts(w13, s13, w2, s2, local_start):
     return a[0], a[1], a[2], a[3]
 
 
-def k3_case(rows, last, seed, npes=1):
-    """The tensors of a one-rank K3 case."""
+def k3_case(rows, last, seed, npes=1, experts=EXPERT_ROWS, ids=None):
+    """The tensors of a one-rank K3 case (``experts``: the table's rows; ``ids``: the picks, else ``_picks``)."""
     from sgl_amd_mono.muse_spark.gfx1250.config import HIDDEN, INTER, MOE_HIDDEN, TOP_K
 
     dev = torch.device("cuda")
     gen = torch.Generator(device=dev).manual_seed(seed)
     torch.manual_seed(seed)
     bf = torch.bfloat16
-    w13, s13, dec13 = _fp4_weight(EXPERT_ROWS, 2 * INTER, MOE_HIDDEN, dev, gen)
-    w2, s2, dec2 = _fp4_weight(EXPERT_ROWS, MOE_HIDDEN, INTER, dev, gen)
+    w13, s13, dec13 = _fp4_weight(experts, 2 * INTER, MOE_HIDDEN, dev, gen)
+    w2, s2, dec2 = _fp4_weight(experts, MOE_HIDDEN, INTER, dev, gen)
     g13, g2, gs13, gs2 = gfx1250_experts(w13, s13, w2, s2, LOCAL_START)
     xin = (torch.randn(rows, MOE_HIDDEN, device=dev) * 0.5).to(bf)
-    ids = _picks(rows, dev, gen)
+    ids = _picks(rows, dev, gen) if ids is None else ids
     scores = torch.rand(rows, TOP_K, device=dev) * 0.3
     stream = torch.randn(rows, HIDDEN, device=dev)
     w = {
@@ -274,9 +274,74 @@ def _time_launches(run, n=20):
         (2, True, True),
         (4, False, True),
         (1, True, True),
+        (12, False, True),
+        (12, True, True),
+        (12, False, False),
     ],
 )
 def test_k3_matches_the_gfx1250_expert_math(rows, last, xq):
+    _needs_xq(xq)
+    _check_k3(k3_case(rows, last, 300 + rows), rows, last, xq)
+
+
+@pytest.mark.parametrize("rows", [3, 5, 6, 7, 9, 10, 11, 13, 14, 15])
+def test_k3_every_plain_decode_width(rows):
+    """The widths between the ones above, on the staged expert input (the last-layer form at the odd ones)."""
+    _check_k3(k3_case(rows, rows % 2 == 1, 300 + rows), rows, rows % 2 == 1, True)
+
+
+def _needs_xq(xq):
+    """The ring build (``SGLANG_AMD_MONO_K3_WAVE=2``, the server's form) reads K2's staged expert input: it has no
+    build without it."""
+    from sgl_amd_mono.muse_spark.gfx1250.stages.ffn import K3_WAVE
+
+    if K3_WAVE == 2 and not xq:
+        pytest.skip(
+            "the ring build takes the expert input as K2's MX FP8 blocks (xq_pre)"
+        )
+
+
+@pytest.mark.parametrize(
+    "rows,experts",
+    [
+        (16, 13),
+        (16, 17),
+        (16, 24),
+        (16, 25),
+        (16, 32),
+        (8, 13),
+        (8, 20),
+        (4, 14),
+        (2, 16),
+        (12, 13),
+        (12, 20),
+        (12, 24),
+        (12, 25),
+    ],
+)
+def test_k3_many_experts_a_rank(rows, experts):
+    """Rows whose picks cover ``experts`` experts of this rank, a few columns each: more tiles than one round of
+    items takes (12 with every wave of the grid on one), so a wave runs two or three items."""
+    from sgl_amd_mono.muse_spark.gfx1250.config import TOP_K
+
+    dev = torch.device("cuda")
+    ids = torch.tensor(
+        [[(t * TOP_K + j) % experts for j in range(TOP_K)] for t in range(rows)],
+        device=dev,
+    )
+    assert ids.unique().numel() == experts
+    k = k3_case(
+        rows,
+        False,
+        700 + experts,
+        experts=experts,
+        ids=(ids + LOCAL_START).to(torch.int32),
+    )
+    _check_k3(k, rows, False, True)
+
+
+def _check_k3(k, rows, last, xq):
+    """A K3 launch (two steps) of the case ``k`` against the reference math."""
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer
     from sgl_amd_mono.muse_spark.gfx1250.build_k3 import K3Build, build_k3
@@ -288,7 +353,6 @@ def test_k3_matches_the_gfx1250_expert_math(rows, last, xq):
     )
 
     dev = torch.device("cuda")
-    k = k3_case(rows, last, 300 + rows)
     w = k.w
     attn_out = torch.full(
         (MAX_TOKENS, HIDDEN), float("nan"), device=dev, dtype=torch.bfloat16
@@ -351,15 +415,19 @@ def test_k3_matches_the_gfx1250_expert_math(rows, last, xq):
 def test_k3_compiles_at_tp8(rows):
     from sgl_amd_mono.muse_spark.gfx1250.build_k3 import K3Build, build_k3
     from sgl_amd_mono.muse_spark.gfx1250.runner import compile_only
+    from sgl_amd_mono.muse_spark.gfx1250.stages.ffn import K3_WAVE
 
-    compile_only(build_k3(K3Build(tokens=rows, npes=8)))
+    compile_only(build_k3(K3Build(tokens=rows, npes=8, xq_pre=K3_WAVE == 2)))
 
 
 def test_a_fault_site_compiles():
     from sgl_amd_mono.muse_spark.gfx1250.build_k3 import K3Build, build_k3
     from sgl_amd_mono.muse_spark.gfx1250.runner import compile_only
+    from sgl_amd_mono.muse_spark.gfx1250.stages.ffn import K3_WAVE
 
-    compile_only(build_k3(K3Build(tokens=8, fault_site=1, fault_after=1)))
+    compile_only(
+        build_k3(K3Build(tokens=8, fault_site=1, fault_after=1, xq_pre=K3_WAVE == 2))
+    )
 
 
 @pytest.mark.parametrize("rows", [8, 16])
@@ -372,6 +440,7 @@ def test_k3_partial_matches_sglang_normal_path(rows):
 
     if not hasattr(mxfp4_moe, "run_gfx1250_a8w4"):
         pytest.skip("this SGLang has no run_gfx1250_a8w4 (sgl-project/sglang#50707)")
+    _needs_xq(False)
 
     from sgl_amd_mono.common import guard
     from sgl_amd_mono.common.peer import PeerBuffer

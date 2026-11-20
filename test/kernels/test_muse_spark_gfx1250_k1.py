@@ -129,6 +129,7 @@ def _one_ulp_fp8(got, ref, what):
         (32, False, True, False),
         (64, True, True, True),
         (5, True, False, True),
+        (12, True, True, True),
     ],
 )
 def test_k1_matches_the_fused_kernel_math(rows, rope, swa, slot64):

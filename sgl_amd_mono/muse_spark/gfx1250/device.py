@@ -17,7 +17,7 @@ from flydsl.expr.typing import T, as_ir_value
 from sgl_amd_mono.common.arch import WAVE
 from sgl_amd_mono.common.ops import CM_DEV, clock, rsrc, uniform, wait_stores
 from sgl_amd_mono.common.plan import BLOCKS, THREADS, WAVES
-from sgl_amd_mono.muse_spark.gfx1250.config import LAYER_SLOTS
+from sgl_amd_mono.muse_spark.gfx1250.config import HIDDEN, LAYER_SLOTS
 
 
 def step_tag(epoch_ptr, layer):
@@ -106,6 +106,13 @@ def wstamp(c, point: int):
         llvm.StoreOp(as_ir_value(now), ptr, alignment=8)
 
 
+# SGLANG_AMD_MONO_OG_ONCE (default 1; a merged launch): the attention's merge writes the normed, gated o rows (the
+# o projection's operand) where it would write o; the o tasks copy them into LDS instead of every CTA rebuilding
+# them from o and the gate, a round a token pair. The same values (the expressions and their order are the og
+# rows'). 0: the first form.
+OG_ONCE = os.environ.get("SGLANG_AMD_MONO_OG_ONCE", "1") == "1"
+
+
 def _push_set():
     """SGLANG_AMD_MONO_PUSH_ALL: the exchanges whose pushes go out from every wave of the CTA, a wave to one
     rank (``wave_rank``): "o" (the attention all-reduce, the default), "pred" (the pooled slices), "fin" (the
@@ -122,6 +129,18 @@ def _push_set():
 
 
 PUSH_SET = _push_set()
+# SGLANG_AMD_MONO_ATTN_CM (default 1; 0: the first layout): the attention all-reduce's region CTA-major,
+# [source][o CTA][token][the CTA's task slot][16 columns], instead of [source][token][column]. A remote store
+# instruction is fast when its lanes fill whole 128 B blocks and several times slower when it writes a block in
+# part. An o task's rows of a token are 64 B and their column neighbours are other CTAs' tasks; CTA-major, a CTA's
+# task slots of a token are 384 contiguous bytes (a round's four slots 256 B, its last two 128 B).
+ATTN_CM = os.environ.get("SGLANG_AMD_MONO_ATTN_CM", "1") == "1"
+ATTN_SLOTS = -(
+    -(HIDDEN // 16) // BLOCKS
+)  # o tasks (16 columns) a CTA: post_attn.O_PER_CTA
+ATTN_COLS = (
+    BLOCKS * ATTN_SLOTS * 16 if ATTN_CM else HIDDEN
+)  # columns a (source, token) of ``attn``
 
 
 def wave_rank(c, npes: int):

@@ -55,7 +55,12 @@ from sgl_amd_mono.common.arch import WAVE
 from sgl_amd_mono.common.ops import (
     CM_DEV,
     ballot,
+    bf2_f32,
+    bf16_pair,
+    bf16_round,
+    butterfly,
     hw_exp2,
+    hw_rsq,
     permlane_swap,
     rsrc,
     uniform,
@@ -68,10 +73,12 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     LOG2E,
     MAX_TOKENS,
     Q_K,
+    RMS_EPS,
     WINDOW,
 )
 from sgl_amd_mono.muse_spark.gfx1250.device import (
     FLAG_STRIDE,
+    OG_ONCE,
     lds_dma_16,
     poll_flags,
     release_stores,
@@ -113,6 +120,26 @@ assert EARLY in ("0", "1", "auto"), EARLY
 
 def early_on(tokens: int) -> bool:
     return EARLY == "1" or (EARLY == "auto" and tokens <= 4)
+
+
+# SGLANG_AMD_MONO_ATTN_FDIV (default 1; 0: integer divisions): the partition planning's divisions by run-time
+# values (a few a request) through a float reciprocal instead of the integer division's expansion. Exact for the
+# counts here: 0 <= n < 2^20, d >= 1, and (n + 0.5) / d lies at least 0.5 / d off every integer.
+ATTN_FDIV = os.environ.get("SGLANG_AMD_MONO_ATTN_FDIV", "1") == "1"
+
+
+def _rcp(d):
+    """1 / d as f32 (``_fdiv``'s reciprocal, made once a divisor)."""
+    return fx.Float32(1.0) / fx.Float32(fx.Int32(d))
+
+
+def _fdiv(n, d, r=None):
+    """n // d for small non-negative n and positive d (``r`` = ``_rcp(d)``)."""
+    if not ATTN_FDIV:
+        return n // d
+    return fx.Int32(
+        (fx.Float32(fx.Int32(n)) + fx.Float32(0.5)) * (_rcp(d) if r is None else r)
+    )
 
 
 assert MERGE_TOP > 0, (BLOCKS, MAX_TOKENS)
@@ -239,6 +266,82 @@ def lds_views(loop, tree):
     return {"qs": loop.qs.ptr, "red": loop.red.ptr, "ring": loop.ring.ptr, "ids": loop.ids.ptr, "comb": tree.comb.ptr}  # fmt: skip
 
 
+# The step's attention plan: [layer kind: full, sliding][the partition in keys, then a request's partition count
+# each], plain int32 words in the scratch's ``attn_plan`` region (``layout.ATTN_PLAN_WORDS``).
+PLAN_WORDS = 1 + MAX_TOKENS
+
+
+def plan_compute(lens, QL, window, part_in, task_tiles):
+    """(the partition in keys, [request r's partitions]) of a layer with ``window`` (0: full) over requests of
+    ``lens`` keys: ``run_kattn``'s planning (the general build's: the same operations on the same values)."""
+    R = len(lens)
+    spans = []
+    for rr in range(R):
+        hi = (lens[rr] + CHUNK - 1) // CHUNK
+        first = fx.max(lens[rr] - QL - window + 1, fx.Int32(0))
+        lo = (window > 0).select(first // CHUNK, fx.Int32(0))
+        spans.append(hi - lo)
+    max_span = spans[0]
+    total_span = spans[0]
+    for rr in range(1, R):
+        max_span = fx.max(max_span, spans[rr])
+        total_span = total_span + spans[rr]
+
+    def tasks_of(pc_):
+        n = fx.Int32(0)
+        r_pc = _rcp(pc_) if ATTN_FDIV else None
+        for rr in range(R):
+            n = n + _fdiv(spans[rr] + pc_ - 1, pc_, r_pc)
+        return n * (LOCAL_KV_HEADS * task_tiles)
+
+    per_cta = (total_span * (LOCAL_KV_HEADS * task_tiles) + BLOCKS - 1) // BLOCKS
+    floor_ = (max_span + MAX_PARTS - 1) // MAX_PARTS
+    pc = fx.max(fx.max(per_cta, floor_), fx.Int32(1))
+    for _ in range(3):
+        pc = (tasks_of(pc) > BLOCKS).select(pc + 1, pc)
+    part = (part_in > 0).select(part_in, pc * CHUNK)
+    rcp_part = _rcp(part) if ATTN_FDIV else None
+    return part, [
+        _fdiv(spans[rr] * CHUNK + part - 1, part, rcp_part) for rr in range(R)
+    ]
+
+
+@flyc.jit
+def run_attn_plan(S, QL, NT, a, plan):
+    """The plan launch's body (one wave): both layer kinds' plans of the step into ``plan`` (the scratch's
+    ``attn_plan`` region; device scope, plain words: the layers' launches follow this one)."""
+    R = S // QL
+    task_tiles = ((QL * GQA + 15) // 16) // NT
+    lens = [
+        fx.Int32(
+            bo.buffer_load(
+                rsrc(a["seq_lens"]),
+                (a["lens64"] != 0).select(2 * rr, rr),
+                vec_width=1,
+                dtype=T.i32,
+            )
+        )
+        + a["extra"]
+        for rr in range(R)
+    ]
+    r_plan = rsrc(plan.value)
+    words = []
+    for kind in range_constexpr(2):
+        part, nps = plan_compute(
+            lens, QL, a["window"] if kind else fx.Int32(0), a["part_in"], task_tiles
+        )
+        words.append([part] + nps)
+    if fx.thread_idx.x == 0:
+        for kind in range_constexpr(2):
+            for j in range_constexpr(R + 1):
+                bo.buffer_store(
+                    fx.Int32(words[kind][j]),
+                    r_plan,
+                    kind * PLAN_WORDS + j,
+                    cache_modifier=CM_DEV,
+                )
+
+
 @flyc.jit
 def run_kattn(c, o_flag=None):
     """K-attn's work on this CTA for ``c["S"]`` rows, ``c["QL"]`` a request.
@@ -341,54 +444,88 @@ def run_kattn(c, o_flag=None):
         )
         return lo, hi
 
-    # the partitions: a request's keys from its first unmasked chunk (a sliding
-    # window's start; 0 for a full layer), the longest such span over at most
-    # MAX_PARTS of them
-    def span_of(r):
-        lo_r, hi_r = chunk_range(seq_len_of(r), 0)
-        return hi_r - lo_r
+    # ``plan_in`` (a build flag): the partition and every request's partition count come from the scratch's
+    # ``attn_plan`` words, computed once a step by the plan launch (``plan_compute``: the planning below, the
+    # same in every layer of a kind): its divisions were most of the instructions ahead of the first KV copy
+    PLAN = bool(c.get("plan_in", False)) and not SL
+    if const_expr(PLAN):
+        r_plan = rsrc(c["plan"].value)
+        pk = (window > 0).select(
+            fx.Int32(PLAN_WORDS), fx.Int32(0)
+        )  # the layer kind's words
+        pv = [
+            fx.Int32(
+                bo.buffer_load(
+                    r_plan, pk + j, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV
+                )
+            )
+            for j in range(R + 1)
+        ]
+        part = pv[0]
+        nps = pv[1:]
 
-    max_span = span_of(0)
-    total_span = max_span
-    for rr in range_constexpr(1, R):
-        sp = span_of(rr)
-        max_span = fx.max(max_span, sp)
-        total_span = total_span + sp
+        def n_parts_of(r):
+            """Request r's partitions (the plan's)."""
+            if const_expr(isinstance(r, int)):
+                return nps[r]
+            out = nps[0]
+            for rr in range_constexpr(1, R):
+                out = (r == rr).select(nps[rr], out)
+            return out
 
-    # the partition (chunks a task) from the step's total chunk work, so that the
-    # step has one task a CTA whatever the request mix (a task costs several chunks'
-    # time beside its chunks: its Q and page ids, the first chunk's exposed
-    # latency, the key-split tree and the publish), the per-request rounding
-    # checked so that no CTA gets a second task, and at least what keeps the
-    # longest request within MAX_PARTS
-    def tasks_of(pc_):
-        n = fx.Int32(0)
-        for rr in range_constexpr(R):
-            lo_r, hi_r = chunk_range(seq_len_of(rr), 0)
-            n = n + ((hi_r - lo_r) + pc_ - 1) // pc_
-        return n * (LOCAL_KV_HEADS * TASK_TILES)
-
-    if const_expr(SL):
-        # (sliding-only: one chunk a task: the step's span x LOCAL_KV_HEADS x TASK_TILES <= BLOCKS)
-        part = CHUNK
-        n_parts = max_span
     else:
-        per_cta = (total_span * (LOCAL_KV_HEADS * TASK_TILES) + BLOCKS - 1) // BLOCKS
-        floor_ = (max_span + MAX_PARTS - 1) // MAX_PARTS
-        pc = fx.max(fx.max(per_cta, floor_), fx.Int32(1))
-        for _ in range_constexpr(3):
-            pc = (tasks_of(pc) > BLOCKS).select(pc + 1, pc)
-        part = (part_in > 0).select(part_in, pc * CHUNK)
-        n_parts = (
-            max_span * CHUNK + part - 1
-        ) // part  # partitions a (request, head) at most
+        # the partitions: a request's keys from its first unmasked chunk (a sliding
+        # window's start; 0 for a full layer), the longest such span over at most
+        # MAX_PARTS of them
+        def span_of(r):
+            lo_r, hi_r = chunk_range(seq_len_of(r), 0)
+            return hi_r - lo_r
 
-    def n_parts_of(r):
-        """Request r's partitions (its span's, the rest of the task slots idle)."""
-        lo, hi = chunk_range(seq_len_of(r), 0)
+        max_span = span_of(0)
+        total_span = max_span
+        for rr in range_constexpr(1, R):
+            sp = span_of(rr)
+            max_span = fx.max(max_span, sp)
+            total_span = total_span + sp
+
+        # the partition (chunks a task) from the step's total chunk work, so that the
+        # step has one task a CTA whatever the request mix (a task costs several chunks'
+        # time beside its chunks: its Q and page ids, the first chunk's exposed
+        # latency, the key-split tree and the publish), the per-request rounding
+        # checked so that no CTA gets a second task, and at least what keeps the
+        # longest request within MAX_PARTS
+        def tasks_of(pc_):
+            n = fx.Int32(0)
+            r_pc = _rcp(pc_) if ATTN_FDIV else None
+            for rr in range_constexpr(R):
+                lo_r, hi_r = chunk_range(seq_len_of(rr), 0)
+                n = n + _fdiv((hi_r - lo_r) + pc_ - 1, pc_, r_pc)
+            return n * (LOCAL_KV_HEADS * TASK_TILES)
+
         if const_expr(SL):
-            return hi - lo
-        return ((hi - lo) * CHUNK + part - 1) // part
+            # (sliding-only: one chunk a task: the step's span x LOCAL_KV_HEADS x TASK_TILES <= BLOCKS)
+            part = CHUNK
+            n_parts = max_span
+        else:
+            per_cta = (
+                total_span * (LOCAL_KV_HEADS * TASK_TILES) + BLOCKS - 1
+            ) // BLOCKS
+            floor_ = (max_span + MAX_PARTS - 1) // MAX_PARTS
+            pc = fx.max(fx.max(per_cta, floor_), fx.Int32(1))
+            for _ in range_constexpr(3):
+                pc = (tasks_of(pc) > BLOCKS).select(pc + 1, pc)
+            part = (part_in > 0).select(part_in, pc * CHUNK)
+            rcp_part = _rcp(part) if ATTN_FDIV else None
+            n_parts = _fdiv(
+                max_span * CHUNK + part - 1, part, rcp_part
+            )  # partitions a (request, head) at most
+
+        def n_parts_of(r):
+            """Request r's partitions (its span's, the rest of the task slots idle)."""
+            lo, hi = chunk_range(seq_len_of(r), 0)
+            if const_expr(SL):
+                return hi - lo
+            return _fdiv((hi - lo) * CHUNK + part - 1, part, rcp_part)
 
     def pflag_at(r, h, rt, p):
         """Pair index of the flag of the task holding row tile ``rt`` of (request r,
@@ -957,15 +1094,28 @@ def run_kattn(c, o_flag=None):
         # the tasks were np_r apart, on different XCDs, each reading the pages from
         # HBM). Groups of 8 partitions x TASK_TILES jobs; the last np_r % 8 partitions
         # in a tail group.
-        j = local % (TASK_TILES * np_r)
-        h = (local // (TASK_TILES * np_r)) % LOCAL_KV_HEADS
+        if const_expr(ATTN_FDIV):
+            tn = TASK_TILES * np_r
+            qj = _fdiv(local, tn)
+            j = local - qj * tn
+            h = qj % LOCAL_KV_HEADS
+        else:
+            j = local % (TASK_TILES * np_r)
+            h = (local // (TASK_TILES * np_r)) % LOCAL_KV_HEADS
         full = (np_r // 8) * 8
         g, w = j // (8 * TASK_TILES), j % (8 * TASK_TILES)
         jt = j - TASK_TILES * full
         tail = fx.max(np_r - full, fx.Int32(1))
         in_full = j < TASK_TILES * full
-        p = in_full.select(g * 8 + w % 8, full + jt % tail)
-        rt0 = in_full.select(w // 8, jt // tail) * NT
+        if const_expr(ATTN_FDIV):
+            qt = _fdiv(
+                fx.max(jt, fx.Int32(0)), tail
+            )  # (jt < 0 on a full-group job: its values unused)
+            p = in_full.select(g * 8 + w % 8, full + (jt - qt * tail))
+            rt0 = in_full.select(w // 8, qt) * NT
+        else:
+            p = in_full.select(g * 8 + w % 8, full + jt % tail)
+            rt0 = in_full.select(w // 8, jt // tail) * NT
         attn_task(r, h, rt0, p)
     stamp(c, 1)  # the attention tasks done
 
@@ -1099,6 +1249,13 @@ def run_kattn(c, o_flag=None):
         np_r = n_parts_of(r)
         direct = True if SL else np_r <= DIRECT_MAX  # (sliding-only: <= 9 partitions)
         row = fx.min(rt * 16 + row16, ROWS - 1)
+        og = OG_ONCE and o_flag is not None
+        if const_expr(og):
+            # the gate of this thread's (row, 8 dims), ahead of the flags' wait
+            g_at = (r * QL + row // GQA) * Q_K + (h * GQA + row % GQA) * HEAD_DIM + d0
+            g_w = fx.Vector(
+                bo.buffer_load(rsrc(a["g"]), g_at // 2, vec_width=4, dtype=T.i32)
+            )
         m = fx.Float32(NEG)
         l = fx.Float32(0.0)
         o0 = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -1136,16 +1293,39 @@ def run_kattn(c, o_flag=None):
                 ok = direct.select(g < np_r, g < GROUPS)
             m, l, o0, o1 = fold_rec(m, l, o0, o1, load_rec(r_src, idx), ok)
         m, l, o0, o1 = combine_lanes(m, l, o0, o1)
-        if (pl == 0) & (rt * 16 + row16 < ROWS):
-            inv = fx.Float32(1.0) / l
-            t = r * QL + (rt * 16 + row16) // GQA
-            ov = fx.Vector.from_elements([fx.Float32(o0[j]) for j in range(4)] + [fx.Float32(o1[j]) for j in range(4)], fx.Float32)  # fmt: skip
-            bo.buffer_store(
-                (ov * inv).to(fx.BFloat16),
-                rsrc(a["o"]),
-                t * Q_K + (h * GQA + (rt * 16 + row16) % GQA) * HEAD_DIM + d0,
-                cache_modifier=CM_DEV,
-            )
+        if const_expr(og):
+            # the og row: o as its bf16, the head's RMSNorm without weight (the og rows' sum: four dims, then
+            # the butterfly over the head's sixteen groups, here two groups a lane), x sigmoid(gate), one bf16
+            # rounding; every lane of a (row, 8 dims) holds the same values
+            g_inv = fx.Float32(1.0) / l
+            g_of = [bf16_round(fx.Float32(o0[j]) * g_inv) for j in range(4)] + [bf16_round(fx.Float32(o1[j]) * g_inv) for j in range(4)]  # fmt: skip
+            s_lo = fx.Float32(0.0)
+            s_hi = fx.Float32(0.0)
+            for j in range_constexpr(4):
+                s_lo = s_lo + g_of[j] * g_of[j]
+                s_hi = s_hi + g_of[4 + j] * g_of[4 + j]
+            s_lo = butterfly(s_lo, (16, 8, 4))
+            s_hi = butterfly(s_hi, (16, 8, 4))
+            g_rstd = hw_rsq((s_lo + s_hi) / float(HEAD_DIM) + RMS_EPS)
+            g_in = [bf2_f32(fx.Int32(g_w[q]))[e] for q in range(4) for e in range(2)]
+            g_vals = [g_of[j] * g_rstd * (fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(g_in[j] * fx.Float32(-LOG2E)))) for j in range(8)]  # fmt: skip
+            g_words = [
+                bf16_pair(g_vals[2 * q], g_vals[2 * q + 1]).bitcast(fx.Int32)
+                for q in range(4)
+            ]
+            if (pl == 0) & (rt * 16 + row16 < ROWS):
+                bo.buffer_store(fx.Vector.from_elements(g_words, fx.Int32), rsrc(a["o"]), g_at // 2, cache_modifier=CM_DEV)  # fmt: skip
+        else:
+            if (pl == 0) & (rt * 16 + row16 < ROWS):
+                inv = fx.Float32(1.0) / l
+                t = r * QL + (rt * 16 + row16) // GQA
+                ov = fx.Vector.from_elements([fx.Float32(o0[j]) for j in range(4)] + [fx.Float32(o1[j]) for j in range(4)], fx.Float32)  # fmt: skip
+                bo.buffer_store(
+                    (ov * inv).to(fx.BFloat16),
+                    rsrc(a["o"]),
+                    t * Q_K + (h * GQA + (rt * 16 + row16) % GQA) * HEAD_DIM + d0,
+                    cache_modifier=CM_DEV,
+                )
         if const_expr(o_flag is not None):
             # the (request, head, row tile)'s o rows are out: its flag, for the og tasks
             release_stores()

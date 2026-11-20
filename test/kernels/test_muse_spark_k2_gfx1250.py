@@ -160,6 +160,8 @@ def _xq_ref(xn):
         (8, False, False),
         (8, True, True),
         (16, True, True),
+        (12, True, False),
+        (12, True, True),
     ],
 )
 def test_k2_matches_the_ops_math(rows, xq, pshard):
@@ -322,7 +324,13 @@ _TIES = [
 ]
 
 
-@pytest.mark.parametrize("rows", [1, 4, 8])
+@pytest.mark.parametrize("rows", [3, 5, 6, 7, 9, 10, 11, 13, 14, 15])
+def test_k2_every_plain_decode_width(rows):
+    """The widths between the ones above, on the served build (the staged expert input)."""
+    test_k2_matches_the_ops_math(rows, True, False)
+
+
+@pytest.mark.parametrize("rows", [1, 4, 8, 12])
 @pytest.mark.parametrize("case", [c[0] for c in _TIES])
 def test_k2_routes_ties_on_every_score_bit(rows, case):
     """Scores that agree in their top 24 bits around the 8th place are still ordered as fp32 orders them (a tie

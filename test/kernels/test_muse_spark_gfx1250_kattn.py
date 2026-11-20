@@ -19,6 +19,8 @@ pytestmark = pytest.mark.skipif(
 
 PAGES = 16384  # cache pages of the test's K / V planes (262k keys)
 MAX_BLOCKS = 16384  # the page table's row
+# twelve plain-decode requests (a row a request): the 12-row width's step
+LENS12 = [95000, 20, 4096, 2048, 2047, 9000, 300, 5, 8192, 17, 60000, 1000]
 
 
 def _epoch(device, deadline_s=20.0):
@@ -82,10 +84,13 @@ def _reference(q, k_cache, v_cache, table, seq_lens, ql, window, scale):
         ),  # 8 requests at a long context (a request holds >= its 8 rows)
         (8, 2, 2047, 0, [95000, 60000]),
         (1, 16, 2047, 256, None),
+        (1, 12, 2047, 256, None),
+        (1, 12, 0, 0, LENS12),
+        (1, 12, 2047, 0, LENS12),
     ],
 )
 def test_kattn_matches_the_verify_attention(
-    ql, R, window, part, lens, peaks=None, kind=""
+    ql, R, window, part, lens, peaks=None, kind="", plan_in=False
 ):
     from sgl_amd_mono.muse_spark.gfx1250.config import (
         HEAD_DIM,
@@ -155,9 +160,23 @@ def test_kattn_matches_the_verify_attention(
         scratch_bytes(kattn_scratch_layout(S, ql)), dtype=torch.uint8, device=dev
     )
     epoch = _epoch(dev)
-    launch = build_kattn(KAttnBuild(tokens=S, q_len=ql, kind=kind))
+    launch = build_kattn(KAttnBuild(tokens=S, q_len=ql, kind=kind, plan_in=plan_in))
     scale_bits = struct.unpack("i", struct.pack("f", scale))[0]
     prefix_lens = (seq_lens - ql).contiguous()  # the keys before the step's rows
+    if plan_in:
+        # the step's plan launch (both layer kinds' plans; the sliding layers' window is 2047 whatever this
+        # layer's), then the launches that load it
+        from sgl_amd_mono.muse_spark.gfx1250.layer import PlanBuild, build_attn_plan
+
+        build_attn_plan(PlanBuild(tokens=S, q_len=ql))(
+            prefix_lens.data_ptr(),
+            0,
+            ql,
+            2047,
+            part,
+            scratch.data_ptr(),
+            stream=torch.cuda.current_stream(),
+        )
     for step in range(2):
         launch(
             q.data_ptr(), o.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(),
@@ -176,6 +195,41 @@ def test_kattn_matches_the_verify_attention(
     assert bad == 0.0, f"{bad:.2%} of the outputs off (max err {err.max().item():.4f})"
     cos = torch.nn.functional.cosine_similarity(got, ref, dim=-1).min().item()
     assert cos > 0.999, f"least row cosine {cos}"
+    return o
+
+
+@pytest.mark.parametrize("R", [3, 5, 6, 7, 9, 10, 11, 13, 14, 15])
+def test_kattn_every_plain_decode_width(R):
+    """The plain-decode widths between the ones above (a row a request, drawn key counts): a sliding and a full
+    layer, the kernel sizing the partition."""
+    test_kattn_matches_the_verify_attention(1, R, 2047, 0, None)
+    test_kattn_matches_the_verify_attention(1, R, 0, 0, None)
+
+
+@pytest.mark.parametrize("window", [0, 2047])
+@pytest.mark.parametrize(
+    "ql,lens",
+    [
+        (1, [9]),
+        (1, [300, 2056, 8000, 17]),
+        (1, [95000, 20, 4096, 2048, 2047, 9000, 300, 5]),
+        (1, [8192] * 16),
+        (1, [8192] * 12),
+        (1, LENS12),
+        (8, [3000, 700]),
+        (8, [95000, 20]),
+    ],
+)
+def test_kattn_plan_launch_gives_the_same_bits(window, ql, lens):
+    """A ``plan_in`` build behind the plan launch against the build that plans on its own: the same partitions,
+    so the same output bits, on a full and a sliding layer (the plan holds both kinds')."""
+    own = test_kattn_matches_the_verify_attention(ql, len(lens), window, 0, lens)
+    planned = test_kattn_matches_the_verify_attention(
+        ql, len(lens), window, 0, lens, plan_in=True
+    )
+    assert torch.equal(own.view(torch.int16), planned.view(torch.int16)), (
+        "the planned launch's output differs"
+    )
 
 
 @pytest.mark.parametrize("kind", ["", "sliding", "full"])
@@ -215,7 +269,9 @@ def test_kattn_peaked_attention(lens, peaks):
     test_kattn_matches_the_verify_attention(8, len(lens), 0, 0, lens, peaks)
 
 
-@pytest.mark.parametrize("rows,ql", [(8, 8), (16, 8), (32, 8), (64, 8), (16, 1)])
+@pytest.mark.parametrize(
+    "rows,ql", [(8, 8), (16, 8), (32, 8), (64, 8), (16, 1), (12, 1)]
+)
 def test_widths_compile(rows, ql):
     from sgl_amd_mono.muse_spark.gfx1250.layer import KAttnBuild, build_kattn
     from sgl_amd_mono.muse_spark.gfx1250.runner import compile_only

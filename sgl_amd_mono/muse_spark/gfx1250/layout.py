@@ -138,6 +138,11 @@ def attn_rows(q_len: int) -> int:
     return q_len * GQA
 
 
+ATTN_PLAN_WORDS = 2 * (
+    1 + MAX_TOKENS
+)  # both layer kinds' plans (attention.PLAN_WORDS each)
+
+
 def kattn_scratch_layout(tokens: int, q_len: int) -> dict:
     """K-attn's scratch (a "pair" is 8 bytes): the tasks' partial rows ((request, head,
     partition, row) x ATTN_PART_ROW fp32 words) and a flag a task, (request, head,
@@ -156,6 +161,9 @@ def kattn_scratch_layout(tokens: int, q_len: int) -> dict:
             ("attn_l2", l2_words // 2),
             ("attn_l2flag", R * LOCAL_KV_HEADS * tiles * ATTN_MERGE_GROUPS),
             ("attn_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
+            # the step's attention plan (``attention.PLAN_WORDS`` int32 words a layer kind; last: the regions
+            # before it keep their offsets)
+            ("attn_plan", ATTN_PLAN_WORDS // 2),
         ],
         align=256,
     )

@@ -90,6 +90,7 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     TOP_K,
 )
 from sgl_amd_mono.muse_spark.gfx1250.device import (
+    ATTN_COLS,
     FLAG_STRIDE,
     PF_LINE,
     PUSH_SET,
@@ -214,7 +215,18 @@ def tile_cols(tokens: int) -> int:
 # all-reduce, half the unpool CTAs take two jobs each)
 FIN_PARTS = int(os.environ.get("SGLANG_AMD_MONO_FIN_PARTS", "0"))
 assert FIN_PARTS in (0, 2, 4, 8), FIN_PARTS
-FIN8_MAX = 4  # 8 fin tasks a token up to this width (FIN_PARTS=0: 8, then 4 up to 8 rows, then 2)
+FIN8_MAX = 4  # 8 fin tasks a token up to this width (FIN_PARTS=0: 8, then 4 up to FIN4_MAX rows, then 2)
+# (4 tasks a token keep ``fin_push_idle`` and leave the unpool a third of the CTAs at 16 rows, two jobs each: the
+# layer bench is faster at 9, 12 and 16 rows than with 2 tasks a token, with the same output bits)
+FIN4_MAX = 16
+# A wave's loads wait for the acknowledgements of the cross-GPU stores it issued before them, so a
+# task that pushes and then polls its peers sees their data late. Two role splits (default on; 0: the first forms):
+# SGLANG_AMD_MONO_FIN_IDLE: a fin task's partial goes out from the CTA's idle waves (``fin_push_idle``, where the
+# part leaves enough of them: 4 tasks a token); the waves that poll the ranks' partials issue no cross-GPU store.
+FIN_IDLE = os.environ.get("SGLANG_AMD_MONO_FIN_IDLE", "1") == "1"
+# SGLANG_AMD_MONO_BND_FIN: the bnd tasks on the first S fin CTAs (their pushes are long acknowledged by
+# then) instead of CTAs 0 .. S, whose unpool job pushes its rows right before the bnd's poll.
+BND_FIN = os.environ.get("SGLANG_AMD_MONO_BND_FIN", "1") == "1"
 
 
 def ar_parts(tokens: int) -> int:
@@ -222,7 +234,7 @@ def ar_parts(tokens: int) -> int:
     spread the pushes and polls; every other CTA (the S bnd CTAs too) unpools."""
     if FIN_PARTS and tokens <= 8:
         return FIN_PARTS
-    return 8 if tokens <= FIN8_MAX else (4 if tokens <= 8 else 2)
+    return 8 if tokens <= FIN8_MAX else (4 if tokens <= FIN4_MAX else 2)
 
 
 def unp_tokens(tokens: int) -> int:
@@ -262,6 +274,7 @@ def k3_bases(tokens: int, npes: int) -> dict:
     return {
         "ar_parts": parts,
         "fin0": fin0,
+        "bnd0": fin0 if BND_FIN else 0,  # the bnd tasks' first CTA
         "unp0": unp0,
         "unp_stride": stride,
         "unp_tasks": tasks,
@@ -300,7 +313,7 @@ def k3_sym_layout(npes: int) -> dict:
     post_attn.sym_layout (the same names, order and formula)."""
     return pair_layout(
         [
-            ("attn", npes * MAX_TOKENS * HIDDEN // 2),
+            ("attn", npes * MAX_TOKENS * ATTN_COLS // 2),
             ("ffn", npes * MAX_TOKENS * MOE_HIDDEN // 2),
             ("unp", MAX_TOKENS * HIDDEN // 2),
             # (TP-expert regions of the gfx950 build; kept so the offsets match post_attn's)
@@ -329,10 +342,11 @@ def k3_sym_layout(npes: int) -> dict:
     )
 
 
-# SGLANG_AMD_MONO_K3_WAVE: how a CTA's waves take the expert (ug / dn) items. 0 (default): the waves split an
-# item's K and their accumulators are summed through LDS; 1: a wave runs whole items over the full K, the next
-# chunks' weights in a register FIFO; 2: the same with the weights through the wave's own LDS ring of async
-# copies (it reads K2's staged MX FP8 input, so it needs an ``xq_pre`` build, as the runner's layer is).
+# SGLANG_AMD_MONO_K3_WAVE: how a CTA's waves take the expert (ug / dn) items. 0 (this module's default): the waves
+# split an item's K and their accumulators are summed through LDS; 1: a wave runs whole items over the full K,
+# the next chunks' weights in a register FIFO; 2 (the server's default, ``muse_spark/spec.py``): the same with the
+# weights through the wave's own LDS ring of async copies (it reads K2's staged MX FP8 input, so it needs an
+# ``xq_pre`` build, as the runner's layer is).
 K3_WAVE = int(os.environ.get("SGLANG_AMD_MONO_K3_WAVE", "0"))
 # the wave-owned items' async LDS ring (``K3_WAVE == 2``): a wave's weights stream through
 # its own ring of chunk slots (``global_load_async_to_lds``: no VGPRs in flight, counted by asynccnt);
@@ -2379,6 +2393,33 @@ def fin_push_all(c, t, part, vals, act, NV: int, AR_COLS: int):
     lds_barrier()  # ``xcol`` is the unpool's next (a fin CTA of a whole-row unpool build)
 
 
+@flyc.jit
+def fin_push_idle(c, t, part, vals, act, NV: int, AR_COLS: int):
+    """The fin task's partial (``vals``: an active thread's NV columns) to every rank's ``ffn`` region from
+    idle waves of the CTA (``FIN_IDLE``): staged in LDS (``xcol``, as ``fin_push_all``), then the wave after the
+    active ones stores every item (four columns, 16 B a lane and store) to rank 0, the next wave to rank 1, ..
+    (itself too). The active waves issue no cross-GPU store, so their polls of the ranks' partials wait behind
+    none; a pushing wave stores to one rank (stores to several ranks in turn leave a wave slowly)."""
+    W, xcol, tid, lane, wave = c["W"], c["xcol"], c["tid"], c["lane"], c["wave"]
+    n_act = AR_COLS // NV
+    WA = n_act // WAVE  # the active waves; the W after them push
+    assert NV == 4 and n_act % WAVE == 0 and WA + W <= WAVES, (NV, AR_COLS, W)
+    lds_barrier()  # (every wave is past the dn items' reads of ``xcol``)
+    if act:
+        for e in range_constexpr(NV):
+            fx.ptr_store(vals[e], xcol + (NV * tid + e))
+    lds_barrier()
+    fvs = [
+        fx.ptr_load(xcol + 4 * (lane + WAVE * q), result_type=_v(4)) for q in range(WA)
+    ]
+    lds_barrier()  # ``xcol`` is free again; the active waves go on to their polls
+    if (wave >= WA) & (wave < WA + W):
+        dest = uniform(fx.min(wave - WA, W - 1))
+        region = preg(rank_base([r.value for r in c["peer_ffn"]], dest), 0, "ffn")
+        for q in range_constexpr(WA):
+            c["put_bf"](region, (c["rank"] * MAX_TOKENS + t) * MOE_HIDDEN + part * AR_COLS + 4 * (lane + WAVE * q), [fx.Float32(fvs[q][e]) for e in range(4)])  # fmt: skip
+
+
 def fin_held(c, t):
     """Token t's eight picks as local experts, or -1 (another rank's): the table ``stage_plan`` left behind
     ``cnt_of``'s counts, from the picks it built the items of."""
@@ -2513,7 +2554,16 @@ def stage_fin(c, t, part):
         MOE_HIDDEN // W
     )  # the rank owning these columns (whole waves share one; used with rs)
     mine = owner == rank
-    if const_expr("fin" in PUSH_SET and W > 1 and not rs):
+    idle = (
+        FIN_IDLE
+        and W > 1
+        and not rs
+        and NV == 4
+        and (AR_COLS // NV) // WAVE + W <= WAVES
+    )
+    if const_expr(idle):
+        fin_push_idle(c, t, part, vals, act, NV, AR_COLS)
+    elif const_expr("fin" in PUSH_SET and W > 1 and not rs):
         fin_push_all(c, t, part, vals, act, NV, AR_COLS)
     else:
         fin_push_first(c, t, col, vals, act, owner, rs)
@@ -2557,7 +2607,12 @@ def stage_fin(c, t, part):
         else:
             bo.buffer_store(fx.Vector.from_elements(words, fx.Int32), r_f, (t * MOE_HIDDEN + col) // 2, cache_modifier=CM_DEV)  # fmt: skip
     stamp(c, 17)  # every rank's partials arrived and summed (fin CTAs)
-    release_stores()
+    if const_expr(idle):
+        # only the active waves stored the result; a pushing wave does not wait for its cross-GPU stores here
+        if wave < (AR_COLS // NV) // WAVE:
+            release_stores()
+    else:
+        release_stores()
     gpu.barrier()
     if tid == 0:
         put(c["fflag"], t * AP + part, fx.Int32(1))
@@ -2873,8 +2928,9 @@ def run_k3(
     stamp(c, 5)  # the fin task done (fin CTAs)
     stage_unpool(c, first_w)
     stamp(c, 6)  # the unpool job(s) done (unpool CTAs)
-    if bid < S:
+    bnd0 = b["bnd0"]
+    if (bid < S) if bnd0 == 0 else ((bid >= bnd0) & (bid < bnd0 + S)):
         if const_expr(late_res):
             poll_flags(c, [(res_flag[0], 0, res_flag[1], FLAG_STRIDE)])
-        stage_bnd(c, bid, x_flag, x_put)
+        stage_bnd(c, bid if bnd0 == 0 else bid - bnd0, x_flag, x_put)
     stamp(c, 7)  # the boundary done (end)

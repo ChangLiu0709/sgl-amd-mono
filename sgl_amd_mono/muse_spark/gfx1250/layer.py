@@ -195,6 +195,7 @@ class KAttnBuild(msgspec.Struct, frozen=True):
     )
     swa_rows: int = 0  # the sliding layers' (SWA) KV pool rows when head-major (0: NHD)
     kv5d: bool = False  # bf16 KV in SGLang's vectorized_5d layout, 64-key pages (else fp8 NHD, 16-key pages)
+    plan_in: bool = False  # the step's partition plan comes from the plan launch (``build_attn_plan``)
 
 
 def _attn_views(lds):
@@ -228,8 +229,16 @@ def kattn_context(
         "kv_rows": key.kv_rows,
         "swa_rows": key.swa_rows,
         "kv5d": key.kv5d,
+        "plan_in": key.plan_in,
     }
-    for region in ("attn_part", "attn_pflag", "attn_l2", "attn_l2flag", "attn_trace"):
+    for region in (
+        "attn_part",
+        "attn_pflag",
+        "attn_l2",
+        "attn_l2flag",
+        "attn_trace",
+        "attn_plan",
+    ):
         c[region[5:]] = sreg(
             scratch, layout[region][0], region
         )  # "attn_part" -> c["part"]
@@ -254,6 +263,7 @@ def build_kattn(key: KAttnBuild):
         **({"hm": key.kv_rows} if key.kv_rows else {}),
         **({"hs": key.swa_rows} if key.swa_rows else {}),
         **({"kv": 5} if key.kv5d else {}),
+        **({"pl": 1} if key.plan_in else {}),
     )
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after = key.fault_site, key.fault_after
@@ -328,6 +338,62 @@ def build_kattn(key: KAttnBuild):
     return launch
 
 
+class PlanBuild(msgspec.Struct, frozen=True):
+    """The attention plan launch of a step of ``tokens`` rows, ``q_len`` a request (``nt`` as the attention's)."""
+
+    tokens: int
+    q_len: int = 8
+    nt: int = 2
+
+
+def build_attn_plan(key: PlanBuild):
+    """``@flyc.jit`` launcher of the step's attention plan (``attention.run_attn_plan``): one wave computes the
+    partition and every request's partition count of both layer kinds and stores them in K-attn's scratch
+    (``attn_plan``), where the step's attention launches built with ``plan_in`` load them. Once a step, ahead of
+    its first attention."""
+    S, QL = key.tokens, key.q_len
+    assert QL in (1, 8) and S % QL == 0 and 1 <= S <= MAX_TOKENS
+    NT = min(key.nt, (attn_rows(QL) + 15) // 16)
+    name = kernel_symbol("muse_spark_attn_plan", s=S, q=QL, n=NT)
+    keyed = key_tuple(key, SOURCES)
+    off = kattn_scratch_layout(S, QL)["attn_plan"][0]
+
+    @flyc.kernel(name=name, known_block_size=[WAVE, 1, 1])
+    def plan(
+        seq_lens: Int64,  # int32 / int64: the request's keys before this step's rows
+        lens64: Int32,  # seq_lens is int64
+        extra: Int32,  # keys past seq_lens (the step's rows a verify adds: QL; 0 for decode)
+        window: Int32,  # the sliding layers' window (keys)
+        part_in: Int32,  # keys a partition (a multiple of CHUNK); 0: sized here
+        scratch: Int64,  # K-attn's scratch
+    ):
+        a = {
+            "seq_lens": seq_lens,
+            "lens64": lens64,
+            "extra": extra,
+            "window": window,
+            "part_in": part_in,
+        }
+        attention.run_attn_plan(S, QL, NT, a, sreg(scratch, off, "attn_plan"))
+
+    @flyc.jit
+    def launch(
+        seq_lens: Int64,
+        lens64: Int32,
+        extra: Int32,
+        window: Int32,
+        part_in: Int32,
+        scratch: Int64,
+        stream: fx.Stream = _STREAM,
+    ):
+        _ = keyed
+        plan(seq_lens, lens64, extra, window, part_in, scratch).launch(
+            grid=(1,), block=(WAVE,), stream=stream
+        )
+
+    return launch
+
+
 def k1_late(tokens: int, npes: int) -> list:
     """A merged launch's CTAs that reach the next K1 late, [(first CTA, count)]: the
     boundary CTAs and, where the others can hold their tiles, the active unpool CTAs
@@ -336,13 +402,13 @@ def k1_late(tokens: int, npes: int) -> list:
     from sgl_amd_mono.muse_spark.gfx1250.stages.pre_attn import spread_max_tiles
 
     b = ffn.k3_bases(tokens, npes)
-    late = [(0, tokens), (b["unp0"], b["unp_jobs"])]
-    # a narrow step (plain decode: 1 .. 4 rows) has few fin CTAs, so the unpool CTAs fit below BLOCKS and the rule
-    # below would leave the GEMV to the few CTAs left (slower than with every CTA but the boundary's);
-    # the unpool ends well before the boundary's x. SGLANG_AMD_MONO_K1_LATE_UNP=1 keeps the unpool CTAs out.
-    narrow = tokens < 8 and os.environ.get("SGLANG_AMD_MONO_K1_LATE_UNP", "0") != "1"
+    late = [(b["bnd0"], tokens), (b["unp0"], b["unp_jobs"])]
+    # Where the fin CTAs are few (plain decode below 8 rows) the unpool CTAs fit below BLOCKS, and the rule below
+    # would leave the GEMV to the few CTAs left (slower than with every CTA but the boundary's); the unpool ends
+    # well before the boundary's x. SGLANG_AMD_MONO_K1_LATE_UNP=1 keeps the unpool CTAs out.
+    spread_all = os.environ.get("SGLANG_AMD_MONO_K1_LATE_UNP", "0") != "1"
     if (
-        narrow
+        spread_all
         or b["unp0"] + b["unp_jobs"] > BLOCKS
         or spread_max_tiles(late) > SPREAD_TILES_MAX
     ):
@@ -388,6 +454,7 @@ class LayerBuild(msgspec.Struct, frozen=True):
     swa_rows: int = 0  # the sliding layers' (SWA) KV pool rows when head-major (K1's SWA writes, the sliding reads; 0: NHD)
     kv5d: bool = False  # bf16 KV in SGLang's vectorized_5d layout, 64-key pages (K1Build / KAttnBuild.kv5d)
     pf: bool = False  # before the next K1, warm each XCD's L2 with the next layer's kernel code (code_prefetch)
+    plan_in: bool = False  # the attention's partition plan comes from the plan launch (KAttnBuild.plan_in)
 
 
 # The code prefetch's table, past K1's scratch: entry (tokens, layer) = the code (address, bytes) of the kernel the
@@ -463,7 +530,7 @@ def build_layer(key: LayerBuild):
         and QL in (1, 8)
         and 1 <= W <= guard.FLAG_WORDS
     )
-    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_dense), x=int(key.tpx), d=int(key.defer_k1 and next_k1), xq=int(key.xq_pre and S <= 16), u=int(key.ug_dyn and key.xq_pre and S == 16), ps=int(key.pshard), ks=int(key.kshard), **({"k": key.kind} if key.kind else {}), **({"hm": key.kv_rows} if key.kv_rows else {}), **({"hs": key.swa_rows} if key.swa_rows else {}), **({"kv": 5} if key.kv5d else {}), **({"pf": 1} if key.pf and next_k1 else {}))  # fmt: skip
+    name = kernel_symbol("muse_spark_layer", s=S, q=QL, w=W, n=int(next_k1), l=int(last), f=key.fault_site, t=int(key.trace), p8=int(key.fp8_dense), x=int(key.tpx), d=int(key.defer_k1 and next_k1), xq=int(key.xq_pre and S <= 16), u=int(key.ug_dyn and key.xq_pre and S == 16), ps=int(key.pshard), ks=int(key.kshard), **({"k": key.kind} if key.kind else {}), **({"hm": key.kv_rows} if key.kv_rows else {}), **({"hs": key.swa_rows} if key.swa_rows else {}), **({"kv": 5} if key.kv5d else {}), **({"pf": 1} if key.pf and next_k1 else {}), **({"pl": 1} if key.plan_in else {}))  # fmt: skip
     keyed = key_tuple(key, SOURCES)
     fault_site, fault_after, tr = key.fault_site, key.fault_after, key.trace
     defer = key.defer_k1 and next_k1
@@ -487,6 +554,7 @@ def build_layer(key: LayerBuild):
         kv_rows=key.kv_rows,
         swa_rows=key.swa_rows,
         kv5d=key.kv5d,
+        plan_in=key.plan_in,
     )
     xq = key.xq_pre and S <= 16
     assert not key.pshard or (W == 8 and not key.fp8_dense), (
@@ -583,7 +651,7 @@ def build_layer(key: LayerBuild):
                 "q": q, "o": o, "k_cache": k_cache, "v_cache": v_cache, "page_table": page_table,
                 "table_stride": table_stride, "table_bytes": table_bytes, "seq_lens": seq_lens,
                 "lens64": lens64, "extra": extra, "window": window, "part_in": part_in,
-                "scale_bits": scale_bits,
+                "scale_bits": scale_bits, "g": g,
             }  # fmt: skip
             k2_args = {
                 "o": o, "g": g, "res": res, "w_o": w_o, "alpha": alpha, "beta": beta, "pre_w": pre_w,

@@ -185,6 +185,10 @@ SPLIT_BUILDS = os.environ.get("SGLANG_AMD_MONO_SPLIT_BUILDS", "1") == "1"
 # the merged launches warm L2 with the next layer's kernel code before their K1 (layer.prefetch_code): the sliding /
 # full builds alternate, and a switch otherwise waits for the other build's instructions; SGLANG_AMD_MONO_CODE_PREFETCH=0: off
 CODE_PREFETCH = os.environ.get("SGLANG_AMD_MONO_CODE_PREFETCH", "1") == "1"
+# SGLANG_AMD_MONO_ATTN_PLAN (default 1; 0: every attention launch plans itself): the attention's partition plan
+# (the same in every layer of a kind of a step) is computed once a step by a one-wave launch ahead of the step's
+# first kernel launch (``layer.build_attn_plan``) and loaded by the attention launches (``plan_in`` builds).
+ATTN_PLAN = os.environ.get("SGLANG_AMD_MONO_ATTN_PLAN", "1") == "1"
 
 
 def kv_head_major_rows(t) -> int:
@@ -246,6 +250,8 @@ class MuseMonoRunner:
         )
         self.pshard = PSHARD and npes == 8 and not self.fp8_dense
         self._k1_done = -1  # the layer whose K1 the previous merged launch ran
+        self._plan: dict = {}
+        self._plan_layer = -1  # the step's first layer on the kernels: its launch begins with the plan (ATTN_PLAN)
         self._trace_shape = None  # (rows, q_len) of the last launch, for the attention trace region's offset
         self.fault_site, self.fault_after = guard.fault_injection(rank) or (0, 0)
         dev, bf16 = self.device, torch.bfloat16
@@ -332,6 +338,16 @@ class MuseMonoRunner:
         self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
 
     # ---------------------------------------------------------------- kernels
+    def plan_kernel(self, rows: int, q_len: int):
+        if (rows, q_len) not in self._plan:
+            from sgl_amd_mono.muse_spark.gfx1250.layer import PlanBuild, build_attn_plan
+
+            no_capture(f"the {rows}-row attention plan first reached")
+            self._plan[(rows, q_len)] = build_attn_plan(
+                PlanBuild(tokens=rows, q_len=q_len)
+            )
+        return self._plan[(rows, q_len)]
+
     def k1_kernel(self, rows: int):
         if (rows, self.kv_rows, self.swa_rows) not in self._k1:
             from sgl_amd_mono.muse_spark.gfx1250.layer import K1Build, build_k1
@@ -355,6 +371,7 @@ class MuseMonoRunner:
                     kv_rows=self.kv_rows,
                     swa_rows=self.swa_rows,
                     kv5d=self.kv5d,
+                    plan_in=ATTN_PLAN,
                 )  # fmt: skip
             )
         return self._kattn[(rows, q_len, self.kv_rows, self.swa_rows)]
@@ -421,6 +438,7 @@ class MuseMonoRunner:
                         swa_rows=self.swa_rows,
                         kv5d=self.kv5d,
                         pf=CODE_PREFETCH,
+                        plan_in=ATTN_PLAN,
                     )  # fmt: skip
                 )
             )
@@ -543,6 +561,8 @@ class MuseMonoRunner:
             return
         compile_only(self.k1_kernel(rows))
         if rows % q_len == 0:
+            if ATTN_PLAN:
+                compile_only(self.plan_kernel(rows, q_len))
             compile_only(self.kattn_kernel(rows, q_len))
             if self.use_layer:
                 for next_k1, kind in {
@@ -824,6 +844,19 @@ class MuseMonoRunner:
         m = self.swa_map
         cur = torch.cuda.current_stream()
         cos_sin = L.cos_sin if L.cos_sin is not None else self.any_cos_sin
+        if ATTN_PLAN:
+            if self._plan_layer < 0:
+                self._plan_layer = next(
+                    j for j, v in enumerate(self.views) if v.kind == "mxfp4" or BF16_K2
+                )
+            if i == self._plan_layer:
+                # the step's attention plan, ahead of its first kernel launch (every step reaches this layer once,
+                # before any attention: no state to go stale)
+                lens = forward_batch.seq_lens
+                self.plan_kernel(rows, q_len)(
+                    _ptr(lens), int(lens.dtype == torch.int64), q_len if forward_batch.forward_mode.is_target_verify() else 0,
+                    max(self.windows), 0, _ptr(self.scratch_attn), stream=cur,
+                )  # fmt: skip
         if self._k1_done != i:  # else the previous merged launch ran this layer's K1
             self.k1_kernel(rows)(
                 _ptr(attn_input), _ptr(L.w_qkvg), _ptr(cos_sin), _ptr(positions), _ptr(slots), _ptr(m),

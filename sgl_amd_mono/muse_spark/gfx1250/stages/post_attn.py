@@ -96,12 +96,16 @@ from sgl_amd_mono.muse_spark.gfx1250.config import (
     TOP_K,
 )
 from sgl_amd_mono.muse_spark.gfx1250.device import (
+    ATTN_CM,
+    ATTN_SLOTS,
     FLAG_STRIDE,
+    OG_ONCE,
     PUSH_SET,
     acquire_loads,
     async_copy16,
     l2_prefetch,
     lds_addr,
+    lds_dma_16,
     lds_load16,
     poll_flags,
     rank_base,
@@ -364,6 +368,20 @@ def k2_rdump_floats(tokens: int) -> int:
     return min(tokens, RD_TOK) * THREADS * R32_Q
 
 
+def attn_at(src, tok, col):
+    """The dword (a value; a bf16 pair and its tag take two) of column ``col`` of (source rank ``src``, token
+    ``tok``)'s partial o row in ``attn``: [source][token][column], or CTA-major (``device.ATTN_CM``:
+    [source][o CTA][token][task slot][16 columns], o task k on CTA k % BLOCKS, slot k / BLOCKS)."""
+    if not ATTN_CM:
+        return (src * MAX_TOKENS + tok) * HIDDEN + col
+    task = col // ROWS
+    return (
+        ((src * BLOCKS + task % BLOCKS) * MAX_TOKENS + tok) * (O_PER_CTA * ROWS)
+        + (task // BLOCKS) * ROWS
+        + col % ROWS
+    )
+
+
 def o_chunk(tokens: int) -> int:
     """o tasks a reduction round (their rows for every token fit ``misc``)."""
     return max(1, min(O_PER_CTA, RED_SETS, O_CHUNK, MAX_TOKENS // tokens))
@@ -445,6 +463,32 @@ def top8_sorted(keys):
             lo, hi = top, [xshfl(v, off) for v in top]
         top = _sort8_bitonic([fx.max(lo[i], hi[7 - i]) for i in range(8)])
     return top
+
+
+# SGLANG_AMD_MONO_TOP8X (default 1; 0: ``top8_sorted``): the picks by ``top8_extract`` (about half the
+# instructions, on the one wave the routing waits for; the same keys in the same order).
+TOP8X = os.environ.get("SGLANG_AMD_MONO_TOP8X", "1") == "1"
+
+
+def top8_extract(keys):
+    """``top8_sorted``'s result by eight extractions: each lane sorts its 8 keys, then eight times the wave's
+    largest head (a butterfly max: the same value on every lane) is taken and the lane that held it moves its
+    list up (the keys are distinct, so one lane does). After p extractions a lane's first 8 - p keys are all
+    that can still be picked."""
+    assert len(keys) == 8 and TOP_K == 8
+    lo4, hi4 = _sort4(keys[:4]), _sort4(keys[4:])
+    s = _sort8_bitonic(lo4 + hi4[::-1])
+    top = []
+    for p in range(8):
+        m = butterfly(s[0], WAVE_OFFSETS, fx.max)
+        top.append(m)
+        hit = s[0] == m
+        s = [hit.select(s[i + 1], s[i]) for i in range(7 - p)]
+    return top
+
+
+def route_top8(keys):
+    return top8_extract(keys) if TOP8X else top8_sorted(keys)
 
 
 def route_bits(v):
@@ -658,6 +702,12 @@ def ring_acc(c, descs, it, xbs):
     return accs
 
 
+# (the CTA-major ``attn`` region: the all-waves tagged push; o task k is on CTA k % BLOCKS, slot k / BLOCKS)
+assert not ATTN_CM or (
+    PUSH_ALL and RSAG == "0" and ATTN_SLOTS == O_PER_CTA and ROWS == 16
+)
+
+
 def o_descs(c):
     """This CTA's o tasks (bid + BLOCKS k; past the last: the last task's rows, computed,
     not published) as ring tiles."""
@@ -679,6 +729,18 @@ def stage_og_rows(c, o_flag=None, QL=8):
     head, row tile) flags first, then device-scope loads."""
     S, tid, xs = c["S"], c["tid"], c["xs"]
     a = c["args"]
+    if const_expr(OG_ONCE and o_flag is not None):
+        # the attention's merge wrote the og rows where o goes (``attention.merge_l2``): a token's row is 2 KB,
+        # four waves' lanes of 16 B; four tokens a copy
+        lane, wave = c["lane"], c["wave"]
+        RT = (QL * GQA + 15) // 16
+        poll_flags(c, [(o_flag, 0, (S // QL) * LOCAL_KV_HEADS * RT, FLAG_STRIDE)])
+        for i in range_constexpr(cdiv(S, 4)):
+            tok = fx.min(4 * i + wave // 4, S - 1)
+            lds_dma_16(a["o"] + fx.Int64(tok * (Q_K * 2)), xs + (tok * (Q_K // 2) + (wave % 4) * (WAVE * 4)), ((wave % 4) * WAVE + lane) * 16, CM_DEV)  # fmt: skip
+        wait_lds_dma(0)
+        gpu.barrier()
+        return
     TPR = THREADS // OG_THREADS  # tokens a round: 2
     e = ((tid % OG_THREADS) // 16) * HEAD_DIM + (tid % 16) * 4
     rounds = list(range(0, S, TPR))
@@ -719,6 +781,26 @@ def o_push_all(c, j0, n):
     dest, td, TPD = wave_rank(c, len(peer_bases))
     region = preg(rank_base(peer_bases, dest), sy_attn, "attn")
     n_quads = n * S * QT
+    if const_expr(ATTN_CM):
+        # CTA-major: store k of the round is (token k / (4 n), slot j0 + (k / 4) % n, rows 4 (k % 4) ..): a wave's
+        # 32 lanes are 512 B of the CTA's tokens' blocks in memory order (a round's slots of a token are whole
+        # 128 B units). A dead slot's rows are stored too: they complete its unit, and nothing reads them.
+        bid = c["bid"]
+        for qq in range_constexpr(cdiv(n_quads, TPD)):
+            k = td + qq * TPD
+            tok = k // (n * QT)
+            jj = (k // QT) % n
+            r4 = (k % QT) * 4
+            if k < n_quads:
+                vv = fx.ptr_load(misc + ((jj * S + tok) * ROWS + r4), result_type=V4)
+                c["put_bf"](
+                    region,
+                    ((my_rank * BLOCKS + bid) * MAX_TOKENS + tok) * (O_PER_CTA * ROWS)
+                    + (j0 + jj) * ROWS
+                    + r4,
+                    [fx.Float32(vv[e]) for e in range(4)],
+                )
+        return
     for qq in range_constexpr(cdiv(n_quads, TPD)):
         k = td + qq * TPD
         jj = k // (S * QT)
@@ -868,10 +950,19 @@ def stage_a_part(c, t, part):
             batch=max(8, (PAIRS // PW) * W),
         )  # fmt: skip
     else:
-        ws = poll(
-            [(own, src * (MAX_TOKENS * HIDDEN // 2) + pb + PW * q, PW) for q in range(PAIRS // PW) for src in range(W)],
-            batch=max(8, (PAIRS // PW) * W),
-        )  # fmt: skip
+        if const_expr(ATTN_CM):
+            specs = [
+                (own, attn_at(src, t, e0 + 2 * PW * q) // 2, PW)
+                for q in range(PAIRS // PW)
+                for src in range(W)
+            ]
+        else:
+            specs = [
+                (own, src * (MAX_TOKENS * HIDDEN // 2) + pb + PW * q, PW)
+                for q in range(PAIRS // PW)
+                for src in range(W)
+            ]
+        ws = poll(specs, batch=max(8, (PAIRS // PW) * W))
     stamp(c, 8)  # every rank's partial o rows arrived (thread 0's columns)
     v = []
     for j in range_constexpr(PAIRS):
@@ -1332,7 +1423,7 @@ def stage_route(c, t, route_flag=None):
             fx.ptr_store(sc, sig + (e0 + h))
             bits.append(route_bits(sc + bias[h]))
             keys.append(route_key(bits[h], e0 + h))
-        top = top8_sorted(keys)
+        top = route_top8(keys)
         pid = fx.Int32(0)
         for p in range_constexpr(TOP_K):
             pid = (lane == p).select(255 - (top[p] & 255), pid)

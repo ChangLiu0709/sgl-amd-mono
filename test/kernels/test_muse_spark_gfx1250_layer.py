@@ -382,12 +382,18 @@ def _same(a, b, what, tol=0.0):
     return exact
 
 
-@pytest.mark.parametrize("S,ql", [(8, 8), (16, 8)])  # K2 / K3 serve S <= 16 on gfx1250
+def _lens(R):
+    """Key counts of ``R`` requests: ``LENS``, repeated with other lengths past its eight."""
+    return [LENS[r % len(LENS)] + 3 * (r // len(LENS)) for r in range(R)]
+
+
+# K2 / K3 serve S <= 16 on gfx1250; q_len 8 a verify block, q_len 1 plain decode (a row a request)
+@pytest.mark.parametrize("S,ql", [(8, 8), (16, 8)] + [(s, 1) for s in range(1, 17)])
 def test_the_merged_launch_matches_the_four(S, ql):
     from sgl_amd_mono.common import guard
 
     dev = torch.device("cuda")
-    L = Layer(S, ql, dev, seed=40 + S)
+    L = Layer(S, ql, dev, seed=40 + S, lens=_lens(S // ql))
     K = _kernels(S, ql)
     stream = torch.cuda.current_stream()
     epoch = _epoch(dev)
@@ -412,11 +418,15 @@ def test_the_merged_launch_matches_the_four(S, ql):
             L.v_cache1.zero_()
         finally:
             B.close()
+    from sgl_amd_mono.muse_spark.gfx1250.device import OG_ONCE
+
     a, b = outs[False], outs[True]
     assert (a["ids"] == b["ids"]).all(), "the routing differs"
     report = []
     for name in (
-        "o",
+        # (with OG_ONCE the merged launch's merge writes the normed, gated rows where the attention's o goes: the
+        # o projection's operand, checked through everything behind it)
+        *(() if OG_ONCE else ("o",)),
         "res",
         "scores",
         "xin",

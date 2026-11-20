@@ -422,13 +422,13 @@ eight = pytest.mark.skipif(
 
 
 @eight
-@pytest.mark.parametrize("rows", [8, 16])
+@pytest.mark.parametrize("rows", [8, 16, 12])
 def test_k3_tp8(rows):
     _assert_ok(run("k3", rows))
 
 
 @eight
-@pytest.mark.parametrize("rows,pshard", [(8, False), (8, True), (16, True)])
+@pytest.mark.parametrize("rows,pshard", [(8, False), (8, True), (16, True), (12, True)])
 def test_k2_tp8(rows, pshard):
     _assert_ok(run("k2", rows, pshard))
 
