@@ -325,7 +325,8 @@ def k2_scratch_layout() -> dict:
             ("k2_xinq", MAX_TOKENS * (XQW + XSW) * 4 // PAIR_BYTES),
             ("k2_resflag", MAX_TOKENS * A_PARTS_MAX * FLAG_STRIDE),
             ("k2_rflag", MAX_TOKENS * FLAG_STRIDE),
-            ("k2_idx", MAX_TOKENS * TOP_K),  # the picks again, tagged
+            # the picks again, tagged, then the scores, tagged (K3's plan and fin tasks poll them)
+            ("k2_idx", 2 * MAX_TOKENS * TOP_K),
             ("k2_xinflag", MAX_TOKENS * FLAG_STRIDE),
             ("k2_oflag", MAX_TOKENS * LOCAL_KV_HEADS * 4 * FLAG_STRIDE),
             ("k2_trace", TRACE_LAYERS * BLOCKS * TRACE_SLOTS),
@@ -1364,7 +1365,7 @@ def stage_route(c, t, route_flag=None):
                 w / (tot + fx.Float32(ROUTE_EPS)) * fx.Float32(ROUTE_SCALE)
             ).bitcast(fx.Int32)
             if const_expr(route_flag is not None):
-                put(c["own_scx"], t * TOP_K + lane, score)
+                put(c["idx"], MAX_TOKENS * TOP_K + t * TOP_K + lane, score)
             bo.buffer_store(
                 pid, rsrc(a["ids"]), t * TOP_K + lane, cache_modifier=CM_DEV
             )

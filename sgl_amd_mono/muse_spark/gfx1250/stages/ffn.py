@@ -473,18 +473,6 @@ def block_sum(c, v, slot):
     return tot
 
 
-def pick(c, t, slot):
-    """Token t's pick in ``slot`` as a local expert, or -1 (another rank's)."""
-    a = c["args"]
-    e = fx.Int32(
-        bo.buffer_load(
-            rsrc(a["ids"]), t * TOP_K + slot, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV
-        )
-    )  # fmt: skip
-    e = e - a["local_start"]
-    return ((e >= 0) & (e < LOCAL_EXPERTS)).select(e, fx.Int32(-1))
-
-
 def pick_at(c, e, col):
     """Expert e's column ``col``'s pick: token TOP_K + slot."""
     return fx.ptr_load(c["pick_of"] + (e * COLS + col))
@@ -843,10 +831,16 @@ def stage_plan(c):
     cnts = [
         fx.Int32(0) for _ in range(EPW)
     ]  # this wave's experts' picks so far (uniform)
+    assert PICKS <= EXPERTS - LOCAL_EXPERTS, (
+        "the picks' table takes cnt_of's unused words"
+    )
     for rr in range_constexpr(ROUNDS):
         p = rr * WAVE + lane
         le = p_ids[rr] - local_start
         ok = (p < PICKS) & (le >= 0) & (le < LOCAL_EXPERTS)
+        if (wave == 0) & (p < PICKS):
+            # pick p's local expert, or -1 (``fin_held``: the fin tasks' slots, from the picks this plan took)
+            fx.ptr_store(ok.select(le, fx.Int32(-1)), cnt_of + (LOCAL_EXPERTS + p))
         col = fx.Int32(0)
         mine = fx.Int32(0) == fx.Int32(1)
         for k in range_constexpr(EPW):
@@ -2385,6 +2379,26 @@ def fin_push_all(c, t, part, vals, act, NV: int, AR_COLS: int):
     lds_barrier()  # ``xcol`` is the unpool's next (a fin CTA of a whole-row unpool build)
 
 
+def fin_held(c, t):
+    """Token t's eight picks as local experts, or -1 (another rank's): the table ``stage_plan`` left behind
+    ``cnt_of``'s counts, from the picks it built the items of."""
+    return [
+        fx.ptr_load(c["cnt_of"] + (LOCAL_EXPERTS + t * TOP_K + sl))
+        for sl in range(TOP_K)
+    ]
+
+
+def fin_score_specs(c, t):
+    """Token t's eight scores as poll specs: K2's tagged ones (``k2_idx``, behind the picks: this launch's or not
+    there yet, two pairs a load) when the plan took the tagged picks; none for a standalone K3, whose plain scores
+    the host wrote."""
+    if c.get("plan_idx") is None:
+        return []
+    return [
+        (c["plan_idx"], MAX_PICKS + t * TOP_K + 2 * j, 2) for j in range(TOP_K // 2)
+    ]
+
+
 @flyc.jit
 def stage_fin(c, t, part):
     """fin task (token t, part): the part's columns of the token's slots (two or
@@ -2414,11 +2428,19 @@ def stage_fin(c, t, part):
         pwv = fx.Vector(pwv)
         pw_words = [pwv[q] for q in range(PPT)]
     pw = [bf2_f32(w)[h] for w in pw_words for h in range(2)]
-    es = [pick(c, t, sl) for sl in range(TOP_K)]
-    scs = [
-        fx.Float32(bo.buffer_load(rsrc(a["scores"]), t * TOP_K + sl, vec_width=1, dtype=T.f32, cache_modifier=CM_DEV))
-        for sl in range(TOP_K)
-    ]  # fmt: skip
+    # The token's slots this rank holds come from the plan (``fin_held``), which took K2's tagged picks ahead of the
+    # routing's plain stores and its flag. A rank none of the step's picks reached has no expert item and runs
+    # this task at once: a plain read of the picks here could still return the previous layer's, a slot it then
+    # waits for and no item writes.
+    es = fin_held(c, t)
+    # the scores ride with the poll of the dn items' rows below (a rank without a pick needs none)
+    sc_specs = fin_score_specs(c, t)
+    sc_plain = []
+    if const_expr(len(sc_specs) == 0):
+        sc_plain = [
+            fx.Float32(bo.buffer_load(rsrc(a["scores"]), t * TOP_K + sl, vec_width=1, dtype=T.f32, cache_modifier=CM_DEV))
+            for sl in range(TOP_K)
+        ]  # fmt: skip
     # the first slot this rank holds (a slot it does not hold polls that one's row)
     fb = fx.Int32(-1)
     for sl in range_constexpr(TOP_K):
@@ -2443,8 +2465,17 @@ def stage_fin(c, t, part):
                 for sl in range(TOP_K)
             ]
             + [(ss_mb, (t * TOP_K + psl) * DN_T + SSL * lane + 2 * k, 2) for k in range(SSL // 2)]
+            + sc_specs,
+            batch=TOP_K + SSL // 2 + len(sc_specs),
         )  # fmt: skip
         stamp(c, 15)  # the token's y rows and their sums of squares arrived (fin CTAs)
+        if const_expr(len(sc_specs) == 0):
+            wsc = sc_plain
+        else:
+            wsc = [
+                fx.Int32(got[TOP_K + SSL // 2 + sl // 2][sl % 2]).bitcast(fx.Float32)
+                for sl in range(TOP_K)
+            ]
         vs = []
         for sl in range_constexpr(TOP_K):
             held = es[sl] >= 0
@@ -2465,7 +2496,7 @@ def stage_fin(c, t, part):
             fx.ptr_store(rinv, red + (TOP_K * WAVES + wave))
         gpu.barrier()
         for sl in range_constexpr(TOP_K):
-            sc = scs[sl] * fx.ptr_load(red + (TOP_K * WAVES + sl))
+            sc = wsc[sl] * fx.ptr_load(red + (TOP_K * WAVES + sl))
             a0 = a0 + sc * vs[sl][0]
             a1 = a1 + sc * vs[sl][1]
             if const_expr(NV == 4):
@@ -2755,8 +2786,9 @@ def run_k3(
     """K3's stages on this CTA. ``route_flag`` / ``xin_flag`` (mailbox regions):
     the routing and the expert input were written earlier in this launch, flagged a
     token each. ``x_flag`` / ``x_put``: see ``stage_bnd``. ``res_flag`` = (region,
-    count): K2's boundary parts flag their stream columns. (``ids_mb`` / ``sc_mb``:
-    TP-expert hand-offs of the gfx950 build, not taken on gfx1250.)"""
+    count): K2's boundary parts flag their stream columns. ``ids_mb``: K2's tagged picks,
+    the tagged scores behind them (``PLAN_IDX``: the plan and the fin tasks poll them;
+    ``sc_mb``, the gfx950 build's TP-expert hand-off, is not taken on gfx1250)."""
     S, bid = c["S"], c["bid"]
     b = c["bases"]
     AP = c["ar_parts"]
@@ -2777,8 +2809,8 @@ def run_k3(
         if const_expr(early):
             poll_flags(c, [(route_flag, 0, S, FLAG_STRIDE)])
         elif const_expr(PLAN_IDX and ids_mb is not None):
-            # the plan polls the tagged picks itself (``stage_plan``); the later plain reads of the picks and the
-            # scores (the fin tasks, tens of us on) find the route task's stores long landed
+            # the plan polls the tagged picks itself (``stage_plan``), and the fin tasks the tagged picks and
+            # scores (``stage_fin``): nothing here reads the route task's plain stores, which its flag covers
             c["plan_idx"] = ids_mb
             poll_flags(c, [(xin_flag, 0, S, FLAG_STRIDE)] + res_flags)
             if const_expr(K3_WAVE == 2 and c["xq_pre"]):

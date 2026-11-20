@@ -126,7 +126,6 @@ def k2_context(
         "own_kss": preg(sym, sy["kss"][0], "kss"),
         "own_vx2": preg(sym, sy["vx2"][0], "vx2"),
         "own_lgx": preg(sym, sy["lgx"][0], "lgx"),
-        "own_scx": preg(sym, sy["scx"][0], "scx"),
         "own_poolq": sym + fx.Int64(sy["poolq"][0]),
         "own_poolf": sym + fx.Int64(sy["poolf"][0]),
     }
