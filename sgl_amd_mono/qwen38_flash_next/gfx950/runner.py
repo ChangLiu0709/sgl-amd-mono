@@ -104,19 +104,15 @@ def no_capture(what: str) -> None:
 def compile_only(launch) -> None:
     """Compile a launch for this process without running it (FlyDSL's compile-only
     mode, for the one call); the first real call then only loads the code."""
-    from flydsl.utils.env import CompileEnvManager
+    import flydsl.compiler as flyc
 
     names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    var = CompileEnvManager.options["compile_only"].env_var
-    old = os.environ.get(var)
-    os.environ[var] = "1"
-    try:
-        launch(*([0] * len(names)), stream=torch.cuda.current_stream())
-    finally:
-        if old is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = old
+    flyc.compile(
+        launch,
+        *([0] * len(names)),
+        stream=torch.cuda.current_stream(),
+        compile_only=True,
+    )
 
 
 def ensure_writable_flydsl_cache() -> None:

@@ -169,11 +169,15 @@ KDA_ARGS = 21
 
 def compile_only(launch) -> None:
     """Build the launcher without dispatching its kernels."""
-    # AITER probes the GPU when imported; test/unit imports this module on CPU
-    from aiter.ops.flydsl.kernels.tensor_shim import _preload_compiled
+    import flydsl.compiler as flyc
 
     names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    _preload_compiled(launch, *([0] * len(names)), torch.cuda.current_stream())
+    flyc.compile(
+        launch,
+        *([0] * len(names)),
+        stream=torch.cuda.current_stream(),
+        compile_only=True,
+    )
 
 
 def ensure_writable_flydsl_cache() -> None:

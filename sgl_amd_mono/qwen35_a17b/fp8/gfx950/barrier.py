@@ -44,19 +44,13 @@ def _ensure_cache() -> None:
 
 
 def compile_only(launch) -> None:
-    from flydsl.utils.env import CompileEnvManager
-
     names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    var = CompileEnvManager.options["compile_only"].env_var
-    old = os.environ.get(var)
-    os.environ[var] = "1"
-    try:
-        launch(*([0] * len(names)), stream=torch.cuda.current_stream())
-    finally:
-        if old is None:
-            os.environ.pop(var, None)
-        else:
-            os.environ[var] = old
+    flyc.compile(
+        launch,
+        *([0] * len(names)),
+        stream=torch.cuda.current_stream(),
+        compile_only=True,
+    )
 
 
 def build_barrier(kind: int, rank: int, fault, tp: int = TP):
