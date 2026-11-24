@@ -336,8 +336,9 @@ MODELS = {
         "packages": ["qwen35_a17b"],
         "tp": 4,
         "paths": {"QWEN35_FP8_MODEL_PATH": f"{HF}/Qwen/Qwen3.5-397B-A17B-FP8"},
-        # InferenceX MI355X FP8: EAGLE, 3 steps, top-1, 4 draft tokens
-        "recipe": ("qwen35_a17b_fp8_mtp_server", "ARGS"),
+        # InferenceX MI355X FP8: EAGLE, 3 steps, top-1, 4 draft tokens; ARGS_CI
+        # lifts its 9236-token context so the accuracy benchmarks fit
+        "recipe": ("qwen35_a17b_fp8_mtp_server", "ARGS_CI"),
         "kernel_tests": ["test/kernels/test_qwen35_a17b_fp8_verify.py"],
         "e2e_tests": [
             "test/e2e/test_qwen35_a17b_fp8_server.py",
