@@ -41,6 +41,7 @@ CHECKPOINTS = [
         "Inferact/MiniMax-M3-EAGLE3-GQA",
         "MiniMaxAI/MiniMax-M3.1-Flash",
         "amd/MiniMax-M3.1-Flash-Quark-MXFP4",
+        "Qwen/Qwen3.5-397B-A17B-FP8",
         "amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8",
         "amd/Qwen3.8-2.4T-A95B-Quark-MXFP4",
         "amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4",
@@ -325,6 +326,28 @@ MODELS = {
         "evals": [],
         "concurrency": [],
         "gate_concurrency": [],
+    },
+    "qwen35_a17b_fp8": {
+        "name": "Qwen3.5-397B-A17B (FP8)",
+        # Phase 1 of the nightly
+        "nightly": True,
+        # set from the first weekly report
+        "baseline": {},
+        "packages": ["qwen35_a17b"],
+        "tp": 4,
+        "paths": {"QWEN35_FP8_MODEL_PATH": f"{HF}/Qwen/Qwen3.5-397B-A17B-FP8"},
+        # InferenceX MI355X FP8: EAGLE, 3 steps, top-1, 4 draft tokens
+        "recipe": ("qwen35_a17b_fp8_mtp_server", "ARGS"),
+        "kernel_tests": ["test/kernels/test_qwen35_a17b_fp8_verify.py"],
+        "e2e_tests": [
+            "test/e2e/test_qwen35_a17b_fp8_server.py",
+            "test/e2e/test_qwen35_a17b_fp8_mtp_server.py",
+        ],
+        "microbench": [],
+        "evals": TEXT_EVALS,
+        # EAGLE verify steps of 4 rows a request: 8 requests fill the 32-row width
+        "concurrency": [1, 2, 4, 8],
+        "gate_concurrency": [1, 8],
     },
     "qwen38_flash_next": {
         "name": "Qwen3.8-Flash-Next (MXFP4)",
