@@ -170,8 +170,10 @@ class Run:
             )
             for line in p.stdout:
                 f.write(line)
+                f.flush()
                 if echo:
                     sys.stdout.write(line)
+                    sys.stdout.flush()
             rc = p.wait()
         try:  # what the step left running (torchrun ranks, servers)
             os.killpg(p.pid, signal.SIGKILL)
