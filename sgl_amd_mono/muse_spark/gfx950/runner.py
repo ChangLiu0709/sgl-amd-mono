@@ -23,7 +23,6 @@ distinct from the same layer's one step earlier; words 1-5 are the guard block.
 
 from __future__ import annotations
 
-import inspect
 import os
 import struct
 from pathlib import Path
@@ -33,6 +32,7 @@ import torch
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
 from sgl_amd_mono.common.plan import BLOCKS
+from sgl_amd_mono.common.precompile import compile_only
 from sgl_amd_mono.muse_spark.gfx950.config import (
     HEAD_DIM,
     HIDDEN,
@@ -149,20 +149,6 @@ def no_capture(what: str) -> None:
     """Raise inside a CUDA graph capture: builds, binds and allocations run eagerly."""
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(f"Muse Spark monokernels: {what} inside a graph capture")
-
-
-def compile_only(launch) -> None:
-    """Compile a launch for this process without running it (FlyDSL's compile-only
-    mode, for the one call); the first real call then only loads the code."""
-    import flydsl.compiler as flyc
-
-    names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    flyc.compile(
-        launch,
-        *([0] * len(names)),
-        stream=torch.cuda.current_stream(),
-        compile_only=True,
-    )
 
 
 def _ensure_writable_flydsl_cache() -> None:

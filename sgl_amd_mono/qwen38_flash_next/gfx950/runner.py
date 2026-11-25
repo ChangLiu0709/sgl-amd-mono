@@ -24,7 +24,6 @@ are the guard block (``common/guard.py``).
 
 from __future__ import annotations
 
-import inspect
 import os
 from pathlib import Path
 from typing import Optional
@@ -99,20 +98,6 @@ def no_capture(what: str) -> None:
             f"Qwen3.8-Flash-Next monokernel: {what} inside a graph capture; the "
             "decode graph runner's eager warmup prepares every batch size first"
         )
-
-
-def compile_only(launch) -> None:
-    """Compile a launch for this process without running it (FlyDSL's compile-only
-    mode, for the one call); the first real call then only loads the code."""
-    import flydsl.compiler as flyc
-
-    names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    flyc.compile(
-        launch,
-        *([0] * len(names)),
-        stream=torch.cuda.current_stream(),
-        compile_only=True,
-    )
 
 
 def ensure_writable_flydsl_cache() -> None:

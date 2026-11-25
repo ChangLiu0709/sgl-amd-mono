@@ -16,7 +16,6 @@ mailbox tags differ from its tags one step earlier; words 1-5 are the guard bloc
 
 from __future__ import annotations
 
-import inspect
 import os
 from pathlib import Path
 
@@ -25,6 +24,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
+from sgl_amd_mono.common.precompile import compile_only
 from sgl_amd_mono.minimax_m3.gfx950.config import (
     HEAD_DIM,
     HIDDEN,
@@ -68,19 +68,6 @@ def no_capture(what: str) -> None:
     """Raise inside a CUDA graph capture: builds, binds and allocations run eagerly."""
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(f"MiniMax-M3 monokernels: {what} inside a graph capture")
-
-
-def compile_only(launch) -> None:
-    """Build the launcher without dispatching its kernels."""
-    import flydsl.compiler as flyc
-
-    names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    flyc.compile(
-        launch,
-        *([0] * len(names)),
-        stream=torch.cuda.current_stream(),
-        compile_only=True,
-    )
 
 
 def _ensure_writable_flydsl_cache() -> None:

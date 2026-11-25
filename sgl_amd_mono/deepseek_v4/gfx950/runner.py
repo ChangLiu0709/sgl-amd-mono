@@ -21,7 +21,6 @@ forward (``bind``), which reads only pointers and shapes.
 
 from __future__ import annotations
 
-import inspect
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +30,7 @@ import torch
 
 from sgl_amd_mono.common import guard
 from sgl_amd_mono.common.peer import PeerBuffer
+from sgl_amd_mono.common.precompile import compile_only
 from sgl_amd_mono.deepseek_v4.gfx950.config import BLOCK_TOKENS
 from sgl_amd_mono.deepseek_v4.gfx950.kernels.layer import (
     build_dsv4_kernel,
@@ -77,20 +77,6 @@ def no_capture(what: str) -> None:
     """Raise inside a CUDA graph capture: builds and binds run eagerly."""
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(f"DeepSeek-V4 monokernels: {what} inside a graph capture")
-
-
-def compile_only(launch) -> None:
-    """Compile a launch for this process without running it (FlyDSL's compile-only
-    mode, for the one call); the first real call then only loads the code."""
-    import flydsl.compiler as flyc
-
-    names = [n for n in inspect.signature(launch.func).parameters if n != "stream"]
-    flyc.compile(
-        launch,
-        *([0] * len(names)),
-        stream=torch.cuda.current_stream(),
-        compile_only=True,
-    )
 
 
 def _ensure_writable_flydsl_cache() -> None:
