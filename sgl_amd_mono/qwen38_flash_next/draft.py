@@ -39,7 +39,6 @@ shuffle.
 from __future__ import annotations
 
 import functools
-import importlib
 import logging
 from typing import Optional
 
@@ -111,7 +110,7 @@ SGLANG_READS = {
     "srt/runtime_context.py": ("get_parallel", '"tp_size"'),
     # the capture check the draft runners run since sgl-project/sglang#46210, and the
     # flag that tells a draft model runner from the target's
-    "srt/kernel_plugins/amd/binding.py|srt/monokernels/guards.py": ("_CaptureCheck",),
+    "srt/kernel_plugins/amd/binding.py|srt/monokernels/runtime.py": ("_CaptureCheck",),
     "srt/model_executor/model_runner.py": ("is_draft_worker",),
 }
 
@@ -294,23 +293,13 @@ def _keep_draft_out_of_capture_check() -> None:
     decode capture: ``none of the 1 captured decode graphs ... runs
     qwen38_flash_next_mtp_draft_hip's monokernels``. The draft's wrapper routes and
     logs those steps itself (see the module docstring), so a draft runner's captures
-    are not checked. The target runner's check is unchanged. Idempotent; a no-op on an
-    SGLang that has no such check, and redundant once SGLang skips draft runners in
-    the check itself."""
-    check = None
-    for module in (
-        "sglang.srt.kernel_plugins.amd.binding",
-        "sglang.srt.monokernels.guards",  # SGLang before sgl-project/sglang#45389
-    ):
-        try:
-            check = getattr(importlib.import_module(module), "_CaptureCheck", None)
-        except ModuleNotFoundError:
-            continue
-        if check is not None:
-            break
-    if check is None:
-        return
-    call = check.__call__
+    are not checked. The target runner's check is unchanged. Idempotent, and
+    redundant once SGLang skips draft runners in the check itself."""
+    try:
+        from sglang.srt.kernel_plugins.amd.binding import _CaptureCheck
+    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+        from sglang.srt.monokernels.runtime import _CaptureCheck
+    call = _CaptureCheck.__call__
     if getattr(call, "_skips_draft_runners", False):
         return
 
@@ -321,7 +310,7 @@ def _keep_draft_out_of_capture_check() -> None:
         return call(self, runner, out, forward_batch, num_tokens)
 
     skip_draft_runners._skips_draft_runners = True
-    check.__call__ = skip_draft_runners
+    _CaptureCheck.__call__ = skip_draft_runners
 
 
 def _build(model, hf_config, ctx) -> _Draft:

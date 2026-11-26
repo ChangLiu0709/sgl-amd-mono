@@ -248,17 +248,19 @@ def test_a_draft_runners_captures_skip_the_capture_check():
     # keeps a draft runner out of it. The target runner's check is unchanged.
     try:
         from sglang.srt.kernel_plugins.amd.binding import _CaptureCheck
-    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
-        from sglang.srt.monokernels.guards import _CaptureCheck
+    except ImportError:
+        pytest.skip("SGLang before sgl-project/sglang#45389 keeps it elsewhere")
 
     def runner(draft):
         return SimpleNamespace(
             capture_bs=[1], model_runner=SimpleNamespace(is_draft_worker=draft)
         )
 
-    def step(mode):
+    def step(mode, rows):  # a draft decode is 1 row a request, a draft extend 4
         return SimpleNamespace(
-            forward_mode=mode, batch_size=1, input_ids=torch.zeros(4, dtype=torch.int64)
+            forward_mode=mode,
+            batch_size=1,
+            input_ids=torch.zeros(rows, dtype=torch.int64),
         )
 
     served = frozenset(
@@ -270,22 +272,25 @@ def test_a_draft_runners_captures_skip_the_capture_check():
         mock.patch("torch.cuda.is_current_stream_capturing", return_value=True),
     ):
         unguarded = _CaptureCheck.__call__
-        draft_steps = (ForwardMode.DECODE, ForwardMode.DRAFT_EXTEND_V2)
-        for mode in draft_steps:  # the failure at the draft decode capture
+        draft_steps = (
+            step(ForwardMode.DECODE, rows=1),
+            step(ForwardMode.DRAFT_EXTEND_V2, rows=4),
+        )
+        for draft_step in draft_steps:  # the failure at the draft decode capture
             with pytest.raises(ValueError, match="none of the 1 captured decode"):
                 check = _CaptureCheck(spec=mtp.SPEC, isa="gfx950", served=served)
-                unguarded(check, runner(True), None, step(mode), 1)
+                unguarded(check, runner(True), None, draft_step, 1)
         mtp._keep_draft_out_of_capture_check()
         guarded = _CaptureCheck.__call__
         assert guarded is not unguarded
         mtp._keep_draft_out_of_capture_check()
         assert _CaptureCheck.__call__ is guarded  # once
         check = _CaptureCheck(spec=mtp.SPEC, isa="gfx950", served=served)
-        for mode in draft_steps:
-            check(runner(True), None, step(mode), 1)
+        for draft_step in draft_steps:
+            check(runner(True), None, draft_step, 1)
         assert check.captured == {} and not check.is_done
         with pytest.raises(ValueError, match="none of the 1 captured decode"):
-            check(runner(False), None, step(ForwardMode.DECODE), 1)
+            check(runner(False), None, step(ForwardMode.DECODE, rows=1), 1)
 
 
 def test_the_runtimes_forward_wraps_the_draft_wrapper():
@@ -447,8 +452,18 @@ def test_build_installs_the_wrapper(monkeypatch, caplog):
     # the checkpoint's config turns SGLang's QSA MTP index sharing on
     hf_config = _replace(VL, text_config=_replace(TEXT))
     hf_config.text_config.index_share_for_mtp_iteration = True
-    with caplog.at_level("INFO"):
+    try:
+        from sglang.srt.kernel_plugins.amd.binding import _CaptureCheck
+    except ImportError:
+        from sglang.srt.monokernels.runtime import _CaptureCheck
+    # the build patches SGLang's capture check; patch.object puts the class's own
+    # __call__ back after the test
+    with (
+        mock.patch.object(_CaptureCheck, "__call__", _CaptureCheck.__call__),
+        caplog.at_level("INFO"),
+    ):
         draft = mtp._build(lm, hf_config, SimpleNamespace(copies={}, deadline_s=1.0))
+        assert _CaptureCheck.__call__._skips_draft_runners  # draft runners skip it
     assert "forward" in lm.__dict__
     assert "are routed by the spec's wrapper of the draft's forward" in caplog.text
     fb = _step("DECODE", 1, 1)
